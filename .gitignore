@@ -1,0 +1,12 @@
+# Ignore large data
+/data/
+*.hdf5
+
+# Python junk
+__pycache__/
+*.pyc
+*.pyo
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
