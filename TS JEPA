@@ -1,0 +1,224 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import Dataset, DataLoader, random_split
+import torch.nn.functional as F
+import numpy as np
+import pandas as pd
+import h5py
+from scipy.signal import resample  # For downsample.
+import pywt  # For wavelets (assume available or approx with torch).
+import jiwer  # For WER; pip in notebook.
+
+# Data class: Loads, preprocesses, augments.
+class BrainDataset(Dataset):
+    """Blueprint for data: Loads signals, applies features/aug."""
+    def __init__(self, data_paths: list[str], label_path: str = None, train: bool = True, aug: bool = True):
+        self.data = []  # List of processed features.
+        self.labels = [] if label_path else None
+        for path in data_paths:
+            with h5py.File(path, 'r') as f:
+                signal = np.array(f['neural_activity'])  # [time, channels].
+                # Preprocess: Band-pass (approx), downsample, normalize.
+                signal = signal - np.mean(signal, 0)  # DC remove.
+                signal = resample(signal, signal.shape[0] // 5, axis=0)  # Down to ~100Hz.
+                signal = (signal - np.mean(signal, 0)) / (np.std(signal, 0) + 1e-6)
+                # Wavelet: Morlet approx via pywt.
+                coeffs = pywt.cwt(signal.T, scales=np.arange(1, 129), wavelet='morl')[0]  # [scales, channels, time].
+                self.data.append(torch.tensor(coeffs, dtype=torch.float32))  # [scales, channels, time].
+        if label_path:
+            df = pd.read_csv(label_path)
+            self.labels = df['text'].tolist()
+        self.aug = aug and train  # Augment only train.
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def __getitem__(self, idx: int):
+        feat = self.data[idx]  # [scales, channels, time].
+        if self.aug:
+            # Aug: Noise, warp, dropout.
+            feat += torch.randn_like(feat) * 0.1
+            warp = np.random.uniform(0.8, 1.2)
+            feat = F.interpolate(feat.unsqueeze(0), scale_factor=(1, warp), mode='linear').squeeze(0)
+            feat[:, torch.randperm(feat.size(1))[:int(0.2 * feat.size(1))]] = 0
+        label = self.labels[idx] if self.labels else None
+        return feat, text_to_ids(label) if label else feat  # Return ids tensor.
+
+# Tokenizers: Simple char-level.
+def text_to_ids(text: str) -> torch.Tensor:
+    """Box texts to numbers: 'a' -> 97, pad=0."""
+    return torch.tensor([ord(c) for c in text] + [0] * (128 - len(text)))  # Max len 128.
+
+def ids_to_text(ids: torch.Tensor) -> str:
+    """Numbers back to text, stop at pad."""
+    return ''.join(chr(i) for i in ids if i > 0)
+
+# Model: TS-JEPA v2 with VICReg.
+class TSJEPA(nn.Module):
+    """Invented pretrainer: Mask, embed, predict with anti-collapse."""
+    def __init__(self, input_dim: int = 128, embed_dim: int = 768):  # Scales as input_dim.
+        super().__init__()
+        self.encoder = nn.Sequential(  # Deeper CNN.
+            nn.Conv1d(input_dim, 256, 3, padding=1), nn.ReLU(), nn.BatchNorm1d(256),
+            nn.Conv1d(256, 512, 5, padding=2), nn.ReLU(), nn.BatchNorm1d(512),
+            nn.Conv1d(512, embed_dim, 7, padding=3), nn.ReLU(), nn.BatchNorm1d(embed_dim)
+        )
+        layer = nn.TransformerEncoderLayer(embed_dim, nhead=12, dim_feedforward=3072, activation='gelu')
+        self.transformer = nn.TransformerEncoder(layer, num_layers=8)  # Deeper.
+        self.predictor = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 2), nn.GELU(),
+            nn.Linear(embed_dim * 2, embed_dim)
+        )
+
+    def forward(self, x: torch.Tensor, mask_ratio: float = 0.4) -> tuple[torch.Tensor, torch.Tensor]:
+        mask = torch.rand(x.shape[:-1]) < mask_ratio  # Mask time/channels.
+        context = x.clone()
+        context[mask.unsqueeze(-1)] = 0
+        embeds = self.encoder(context)
+        embeds = embeds.permute(2, 0, 1)  # Time first.
+        embeds = self.transformer(embeds)
+        embeds = embeds.permute(1, 0, 2)
+        target = self.encoder(x).detach()
+        pred = self.predictor(embeds)
+        return pred, target
+
+    def vicreg_loss(self, embeds: torch.Tensor, lambda_: float = 1, mu: float = 1, nu: float = 0.04) -> torch.Tensor:
+        """Anti-collapse: Variance, invariance, covariance."""
+        std = torch.sqrt(embeds.var(dim=0) + 1e-4)
+        var_loss = F.relu(1 - std).mean()
+        embeds = embeds - embeds.mean(0)
+        cov = (embeds.T @ embeds) / embeds.size(0)
+        cov_loss = (cov ** 2).sum() / embeds.size(1) - cov.diag().sum() / embeds.size(1)
+        return lambda_ * var_loss + mu * (embeds - embeds.mean(0)).pow(2).mean() + nu * cov_loss
+
+# Decoder: CTC for alignment-free.
+class CTCDecoder(nn.Module):
+    """Seq decoder: RNN + CTC."""
+    def __init__(self, embed_dim: int, vocab: int = 257):  # +1 blank.
+        super().__init__()
+        self.rnn = nn.LSTM(embed_dim, 1024, 2, bidirectional=True)
+        self.fc = nn.Linear(2048, vocab)
+
+    def forward(self, embeds: torch.Tensor) -> torch.Tensor:
+        out, _ = self.rnn(embeds.permute(2, 0, 1))  # Time first.
+        return self.fc(out.permute(1, 0, 2))
+
+# GRU baseline for ensemble.
+class GRUBaseline(nn.Module):
+    """Simple backup: GRU + CTC."""
+    def __init__(self, input_dim: int, hidden: int = 1024, vocab: int = 257):
+        super().__init__()
+        self.gru = nn.GRU(input_dim, hidden, 3, bidirectional=True)
+        self.fc = nn.Linear(2 * hidden, vocab)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Flatten scales/channels to input_dim.
+        x = x.view(x.size(0), -1, x.size(-1))  # Batch, feat, time.
+        out, _ = self.gru(x.permute(2, 0, 1))
+        return self.fc(out.permute(1, 0, 2))
+
+# Train JEPA: With VICReg, AMP, scheduler.
+def train_jepa(model: TSJEPA, loader: DataLoader, epochs: int = 100, device: str = 'cuda'):
+    """Teach patterns: Mask, predict, regularize."""
+    model.to(device)
+    opt = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
+    sched = CosineAnnealingLR(opt, T_max=epochs)
+    scaler = torch.amp.GradScaler('cuda')  # AMP for speed.
+    for ep in range(epochs):
+        for batch, _ in loader:
+            batch = batch.to(device)
+            with torch.amp.autocast('cuda'):
+                pred, tgt = model(batch)
+                mse = F.mse_loss(pred, tgt)
+                vic = model.vicreg_loss(pred)
+                loss = mse + vic
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad()
+        sched.step()
+        print(f'Ep {ep}: Loss {loss.item():.4f}')
+
+# Fine-tune: Ensemble with CTC, val WER.
+def fine_tune(jepa: TSJEPA, dec: CTCDecoder, gru: GRUBaseline, train_loader: DataLoader, val_loader: DataLoader, epochs: int = 50, device: str = 'cuda'):
+    """Teach text: Blend models, CTC loss."""
+    params = list(jepa.parameters()) + list(dec.parameters()) + list(gru.parameters())
+    opt = optim.AdamW(params, lr=3e-5)
+    sched = CosineAnnealingLR(opt, T_max=epochs)
+    ctc_loss = nn.CTCLoss()
+    scaler = torch.amp.GradScaler('cuda')
+    for ep in range(epochs):
+        for feat, tgt in train_loader:
+            feat, tgt = feat.to(device), tgt.to(device)
+            with torch.amp.autocast('cuda'):
+                embeds = jepa.encoder(feat)  # Reuse.
+                embeds = embeds.permute(2, 0, 1)
+                embeds = jepa.transformer(embeds)
+                embeds = embeds.permute(1, 0, 2)
+                log_j = dec(embeds)
+                log_g = gru(feat)
+                log_blend = 0.8 * log_j + 0.2 * log_g
+                input_len = torch.full((feat.size(0),), log_blend.size(1), dtype=torch.long)
+                tgt_len = (tgt != 0).sum(1)
+                loss = ctc_loss(log_blend.transpose(0, 1), tgt, input_len, tgt_len)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            opt.zero_grad()
+        sched.step()
+        # Val WER.
+        val_wer = evaluate(val_loader, jepa, dec, gru, device)
+        print(f'Ep {ep}: Loss {loss.item():.4f}, Val WER {val_wer:.2f}%')
+        torch.save({'jepa': jepa.state_dict(), 'dec': dec.state_dict(), 'gru': gru.state_dict()}, f'ckpt_ep{ep}.pt')
+
+# Evaluate: Beam decode CTC, compute WER.
+def evaluate(loader: DataLoader, jepa: TSJEPA, dec: CTCDecoder, gru: GRUBaseline, device: str) -> float:
+    """Test guesses: Blend, decode, WER."""
+    wers = []
+    with torch.no_grad():
+        for feat, tgt in loader:
+            feat = feat.to(device)
+            embeds = jepa.encoder(feat)
+            embeds = embeds.permute(2, 0, 1)
+            embeds = jepa.transformer(embeds)
+            embeds = embeds.permute(1, 0, 2)
+            log_j = dec(embeds)
+            log_g = gru(feat)
+            probs_j = F.softmax(log_j, -1)
+            entropy = - (probs_j * torch.log(probs_j + 1e-6)).sum(-1).mean()
+            log = log_j if entropy < 0.5 else 0.8 * log_j + 0.2 * log_g
+            # Beam decode approx: Argmax + collapse blanks/repeats.
+            pred_ids = log.argmax(-1)
+            pred_ids = [torch.unique_consecutive(p[p != 0]) for p in pred_ids]  # Remove blanks/repeats.
+            pred_texts = [ids_to_text(p) for p in pred_ids]
+            true_texts = [ids_to_text(t) for t in tgt]
+            wers.append(jiwer.wer(true_texts, pred_texts))
+    return np.mean(wers) * 100
+
+# Inference: Quantize for speed.
+@torch.inference_mode()
+def predict(jepa: TSJEPA, dec: CTCDecoder, gru: GRUBaseline, feat: torch.Tensor, device: str) -> str:
+    """Guess text: Blend, decode."""
+    jepa = torch.quantization.quantize_dynamic(jepa, {nn.Linear, nn.Conv1d}, dtype=torch.qint8)
+    dec = torch.quantization.quantize_dynamic(dec, {nn.Linear, nn.LSTM}, dtype=torch.qint8)
+    gru = torch.quantization.quantize_dynamic(gru, {nn.Linear, nn.GRU}, dtype=torch.qint8)
+    # Same as evaluate, return pred_text.
+
+# Main: End-to-end.
+if __name__ == '__main__':
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    full_ds = BrainDataset(['train.h5'], 'train_labels.csv')
+    train_size = int(0.8 * len(full_ds))
+    train_ds, val_ds = random_split(full_ds, [train_size, len(full_ds) - train_size])
+    train_loader = DataLoader(train_ds, batch_size=16, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=16)
+    jepa = TSJEPA(input_dim=128)  # Adjust to wavelet scales.
+    train_jepa(jepa, train_loader)
+    dec = CTCDecoder(768, 257)
+    gru = GRUBaseline(128 * 64, 1024, 257)  # Flatten input.
+    fine_tune(jepa, dec, gru, train_loader, val_loader)
+    # Test: test_ds = BrainDataset(['test.h5'], train=False)
+    # preds = [predict(jepa, dec, gru, feat, device) for feat in DataLoader(test_ds, 1)]
+    # pd.DataFrame({'id': range(len(preds)), 'predicted': preds}).to_csv('submission.csv', index=False)
