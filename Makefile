@@ -27,8 +27,31 @@ install:
 download:
 \tBT25_DATA_DIR=$(DATA_DIR) $(ACT) && $(PY) main.py
 
+multi:
+\tpython src/train_multisession.py --root "$(BT25_ROOT)" --epochs 2 --max_batches 500
+
+submit-one:
+\tpython src/build_submission.py --test_h5 "$(BT25_ROOT)/t15.2023.10.06/data_test.hdf5" --ckpt checkpoints/baseline.pt --out outputs/submission_2023-10-06.csv
+
+quicklook:
+\tpython src/plot_quicklook.py "$(BT25_ROOT)/t15.2023.10.06/data_train.hdf5" --trial 0 --out outputs/quicklook.png
+
 preview:
 \tBT25_DATA_DIR=$(DATA_DIR) BT25_OUT_DIR=$(OUT_DIR) $(ACT) && $(PY) main.py
 
+kenlm-corpus:
+\tpython src/lm_kenlm_build.py --root "$(BT25_ROOT)" --corpus artifacts/corpus.txt
+
+kenlm-build:
+\tpython src/lm_kenlm_build.py --root "$(BT25_ROOT)" --build --order 5 \
+\t  --corpus artifacts/corpus.txt --arpa artifacts/lm.arpa --binary artifacts/lm.binary
+
+decode-kenlm:
+\tpython src/decode_kenlm.py --val "$(BT25_ROOT)/t15.2023.10.06/data_val.hdf5" \
+\t  --ckpt checkpoints/baseline.pt --beam 12 --lm_weight 0.8 \
+\t  --out outputs/val_kenlm.csv
+
+
 clean:
 \trm -rf $(OUT_DIR)
+
